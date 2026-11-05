@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <title>Wirtualne okno</title>
+  <style>
+    body { margin: 0; overflow: hidden; }
+    #info { position: fixed; top: 10px; left: 10px; color: white; background: black; font: 14px monospace; }
+  </style>
+  <!-- Biblioteki z internetu: three.js (grafika 3D) i MediaPipe (wykrywanie twarzy) -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "mediapipe": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs"
+      }
+    }
+  </script>
+</head>
+<body>
+<div id="info"></div>
+
+<script type="module">
+import * as THREE from "three";
+import { FaceLandmarker, FilesetResolver } from "mediapipe";
+
+// ================= USTAWIENIA (długości w metrach) =================
+const SZEROKOSC_EKRANU = 0.344; // laptop 15,6"
+const KAT_KAMERY = 60;          // kąt widzenia kamery w poziomie (w stopniach)
+const ROZSTAW_OCZU = 0.063;     // średnia odległość między źrenicami
+
+// ================= POKÓJ Z PROSTYCH BRYŁ =================
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+document.body.appendChild(renderer.domElement);
+window.addEventListener("resize", () => renderer.setSize(window.innerWidth, window.innerHeight));
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera();
+
+// Środek ekranu to punkt (0, 0, 0). Pokój stoi za ekranem (z < 0), podłoga jest 90 cm niżej.
+const PODLOGA = -0.9;
+
+// Pudełko oglądane od środka (BackSide = widać ściany od wewnątrz)
+// Kolejność ścian: prawa, lewa, sufit, podłoga, przednia (niewidoczna), tylna.
+const koloryScian = [0xe6dccb, 0xe6dccb, 0xf4f1ec, 0xa0703f, 0xffffff, 0x2f4f55];
+const sciany = koloryScian.map((kolor) => new THREE.MeshStandardMaterial({ color: kolor, side: THREE.BackSide }));
+const pokoj = new THREE.Mesh(new THREE.BoxGeometry(3.6, 2.6, 4.6), sciany);
+pokoj.position.set(0, PODLOGA + 1.3, -2.3);
+scene.add(pokoj);
+
+// Stawia na podłodze prostopadłościan o środku w punkcie (x, z)
+function bryla(szerokosc, wysokosc, glebokosc, x, z, kolor) {
+  const ksztalt = new THREE.BoxGeometry(szerokosc, wysokosc, glebokosc);
+  const material = new THREE.MeshStandardMaterial({ color: kolor });
+  const mesh = new THREE.Mesh(ksztalt, material);
+  mesh.position.set(x, PODLOGA + wysokosc / 2, z);
+  scene.add(mesh);
+}
+
+bryla(2.0, 0.9, 0.9, 0, -4.1, 0xc9962e);     // daleko
+bryla(1.0, 0.45, 0.55, 0, -3.0, 0x8a5a35);   // w połowie pokoju
+bryla(0.3, 0.8, 0.3, 0.65, -1.4, 0x3a7d45);  // blisko ekranu
+
+// Światło tylko po to, żeby było widać bryły
+scene.add(new THREE.AmbientLight(0xffffff, 0.8));
+const swiatlo = new THREE.PointLight(0xffffff, 6);
+swiatlo.position.set(0, 1.2, -2.5);
+scene.add(swiatlo);
+
+// ================= OBRAZ ZALEŻNY OD POZYCJI OKA =================
+// Kamera 3D stoi w miejscu oka, a krawędzie ekranu są krawędziami okna.
+function ustawKamere(oko) {
+  const wysokosc = SZEROKOSC_EKRANU * window.innerHeight / window.innerWidth;
+  const blisko = 0.05;       // najbliższa odległość, jaką kamera rysuje
+  const k = blisko / oko.z;  // przeniesienie krawędzi ekranu na płaszczyznę "blisko"
+  const lewo = (-SZEROKOSC_EKRANU / 2 - oko.x) * k;
+  const prawo = (SZEROKOSC_EKRANU / 2 - oko.x) * k;
+  const dol = (-wysokosc / 2 - oko.y) * k;
+  const gora = (wysokosc / 2 - oko.y) * k;
+  camera.projectionMatrix.makePerspective(lewo, prawo, gora, dol, blisko, 50);
+  camera.projectionMatrixInverse.copy(camera.projectionMatrix).invert();
+  camera.position.copy(oko);
+}
+
+// ================= WYKRYWANIE TWARZY =================
+const video = document.createElement("video");
+const oko = new THREE.Vector3(0, 0, 0.6); // pozycja oka względem środka ekranu
+let wykrywacz = null;                     // MediaPipe; null = brak kamery
+let ostatniaKlatka = -1;
+let stan = "ładowanie...";
+
+async function uruchomKamere() {
+  try {
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
+    await video.play();
+    const pliki = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+    wykrywacz = await FaceLandmarker.createFromOptions(pliki, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO",
+    });
+  } catch (blad) {
+    console.error(blad);
+    stan = "brak kamery - steruj myszą";
+  }
+}
+uruchomKamere();
+
+function sledzTwarz() {
+  const wynik = wykrywacz.detectForVideo(video, performance.now());
+  if (wynik.faceLandmarks.length === 0) {
+    stan = "nie widzę twarzy";
+    return;
+  }
+  stan = "kamera";
+  const a = wynik.faceLandmarks[0][468]; // środek jednej tęczówki (współrzędne od 0 do 1)
+  const b = wynik.faceLandmarks[0][473]; // środek drugiej tęczówki
+  const w = video.videoWidth;
+  const h = video.videoHeight;
+
+  const f = (w / 2) / Math.tan((KAT_KAMERY / 2) * Math.PI / 180); // ogniskowa w pikselach
+  const rozstawPikseli = Math.hypot((a.x - b.x) * w, (a.y - b.y) * h);
+  const z = f * ROZSTAW_OCZU / rozstawPikseli;  // im mniejszy rozstaw oczu, tym dalej głowa
+  const u = ((a.x + b.x) / 2) * w - w / 2;      // punkt między oczami względem środka obrazu
+  const v = ((a.y + b.y) / 2) * h - h / 2;
+  oko.set(-u * z / f, -v * z / f, z);           // z pikseli na metry; obraz z kamery jest odbity
+}
+
+// Bez kamery mysz udaje ruch głowy
+window.addEventListener("mousemove", (e) => {
+  if (wykrywacz) return;
+  oko.x = (e.clientX / window.innerWidth - 0.5) * 0.6;
+  oko.y = (0.5 - e.clientY / window.innerHeight) * 0.4;
+});
+
+// ================= GŁÓWNA PĘTLA =================
+const info = document.getElementById("info");
+renderer.setAnimationLoop(() => {
+  if (wykrywacz && video.currentTime !== ostatniaKlatka) { // każdą klatkę z kamery analizujemy raz
+    ostatniaKlatka = video.currentTime;
+    sledzTwarz();
+  }
+  ustawKamere(oko);
+  renderer.render(scene, camera);
+  info.textContent = stan + " | oko [m]: " + oko.toArray().map((n) => n.toFixed(2)).join(", ");
+});
+</script>
+</body>
+</html>
